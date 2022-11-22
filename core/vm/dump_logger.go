@@ -160,6 +160,12 @@ func (l *ParityLogger) CaptureEnd(output []byte, gasUsed uint64, t time.Duration
 		} else {
 			item.TransactionLastTrace = 0
 		}
+	}
+}
+
+func (l *ParityLogger) Dump(blockHash common.Hash) {
+	for _, item := range l.items {
+		item.BlockHash = blockHash
 		l.encoder.Encode(item)
 	}
 }
