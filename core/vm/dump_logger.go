@@ -89,11 +89,13 @@ type ParityLogContext struct {
 
 type ParityLogger struct {
 	context           *ParityLogContext
+	sb                *strings.Builder
 	encoder           *json.Encoder
 	activePrecompiles []common.Address
 	file              *os.File
 	stack             []*ParityTraceItem
 	items             []*ParityTraceItem
+	total_items       []*ParityTraceItem
 }
 
 // NewParityLogger creates a new EVM tracer that prints execution steps as parity trace format
@@ -104,7 +106,8 @@ func NewParityLogger(ctx *ParityLogContext, blockNumber uint64, perFolder, perFi
 		return nil, err
 	}
 
-	l := &ParityLogger{context: ctx, encoder: json.NewEncoder(file), file: file}
+	sb := &strings.Builder{}
+	l := &ParityLogger{context: ctx, sb: sb, encoder: json.NewEncoder(sb), file: file}
 	if l.context == nil {
 		l.context = &ParityLogContext{}
 	}
@@ -112,6 +115,9 @@ func NewParityLogger(ctx *ParityLogContext, blockNumber uint64, perFolder, perFi
 }
 
 func (l *ParityLogger) Close() error {
+	if _, err := l.file.WriteString(l.sb.String()); err != nil {
+		return err
+	}
 	return l.file.Close()
 }
 
@@ -161,10 +167,11 @@ func (l *ParityLogger) CaptureEnd(output []byte, gasUsed uint64, t time.Duration
 			item.TransactionLastTrace = 0
 		}
 	}
+	l.total_items = append(l.total_items, l.items...)
 }
 
 func (l *ParityLogger) Dump(blockHash common.Hash) {
-	for _, item := range l.items {
+	for _, item := range l.total_items {
 		item.BlockHash = blockHash
 		l.encoder.Encode(item)
 	}
@@ -234,7 +241,8 @@ func ReceiptDumpLogger(blockHash common.Hash, blockNumber uint64, perFolder, per
 		return err
 	}
 
-	encoder := json.NewEncoder(file)
+	sb := &strings.Builder{}
+	encoder := json.NewEncoder(sb)
 	for _, receipt := range receipts {
 		for _, log := range receipt.Logs {
 			oldHash := log.BlockHash
@@ -246,43 +254,47 @@ func ReceiptDumpLogger(blockHash common.Hash, blockNumber uint64, perFolder, per
 			}
 		}
 	}
+	if _, err := file.WriteString(sb.String()); err != nil {
+		return err
+	}
 	return nil
 }
 
 type TxLogger struct {
-	blockNumber uint64
-	blockHash   common.Hash
-	file        *os.File
-	encoder     *json.Encoder
-	signer      types.Signer
-	isLondon    bool
-	baseFee     *big.Int
+	l1BlockNumber uint64
+	blockNumber   uint64
+	blockHash     common.Hash
+	sb            *strings.Builder
+	file          *os.File
+	encoder       *json.Encoder
+	signer        types.Signer
+	isLondon      bool
+	baseFee       *big.Int
 }
 
-func NewTxLogger(signer types.Signer, isLondon bool, baseFee *big.Int, blockHash common.Hash, blockNumber uint64, perFolder, perFile uint64) (*TxLogger, error) {
+func NewTxLogger(signer types.Signer, isLondon bool, baseFee *big.Int, blockHash common.Hash, blockNumber, l1BlockNumber, perFolder, perFile uint64) (*TxLogger, error) {
 	file, err := getFile("transactions", blockNumber, perFolder, perFile)
 	if err != nil {
 		return nil, err
 	}
+	sb := &strings.Builder{}
 	return &TxLogger{
-		blockNumber: blockNumber,
-		blockHash:   blockHash,
-		file:        file,
-		encoder:     json.NewEncoder(file),
-		signer:      signer,
-		isLondon:    isLondon,
-		baseFee:     baseFee,
+		blockNumber:   blockNumber,
+		blockHash:     blockHash,
+		file:          file,
+		sb:            sb,
+		encoder:       json.NewEncoder(sb),
+		signer:        signer,
+		isLondon:      isLondon,
+		baseFee:       baseFee,
+		l1BlockNumber: l1BlockNumber,
 	}, nil
 }
 
 func (t *TxLogger) Dump(index int, tx *types.Transaction, receipt *types.Receipt) error {
 	from, _ := types.Sender(t.signer, tx)
 	// Assign the effective gas price paid
-	effectiveGasPrice := hexutil.Uint64(tx.GasPrice().Uint64())
-	if t.isLondon {
-		gasPrice := new(big.Int).Add(t.baseFee, tx.EffectiveGasTipValue(t.baseFee))
-		effectiveGasPrice = hexutil.Uint64(gasPrice.Uint64())
-	}
+	effectiveGasPrice := hexutil.Uint64(t.baseFee.Uint64())
 	entry := map[string]interface{}{
 		"blockNumber":       t.blockNumber,
 		"blockHash":         t.blockHash,
@@ -299,9 +311,34 @@ func (t *TxLogger) Dump(index int, tx *types.Transaction, receipt *types.Receipt
 		"gasFeeCap":         tx.GasFeeCap(),
 		"gasTipCap":         tx.GasTipCap(),
 		"effectiveGasPrice": effectiveGasPrice,
+		"gasUsedForL1":      receipt.GasUsedForL1,
 		"type":              tx.Type(),
 		"value":             tx.Value(),
 		"status":            receipt.Status,
+		"l1BlockNumber":     t.l1BlockNumber,
+	}
+
+	// Arbitrum: support arbitrum-specific transaction types
+	switch inner := tx.GetInner().(type) {
+	case *types.ArbitrumDepositTx:
+		entry["requestId"] = &inner.L1RequestId
+	case *types.ArbitrumContractTx:
+		entry["requestId"] = &inner.RequestId
+	case *types.ArbitrumRetryTx:
+		entry["ticketId"] = &inner.TicketId
+		entry["refundTo"] = &inner.RefundTo
+		entry["maxRefund"] = (*hexutil.Big)(inner.MaxRefund)
+		entry["submissionFeeRefund"] = (*hexutil.Big)(inner.SubmissionFeeRefund)
+	case *types.ArbitrumSubmitRetryableTx:
+		entry["requestId"] = &inner.RequestId
+		entry["l1BaseFee"] = (*hexutil.Big)(inner.L1BaseFee)
+		entry["depositValue"] = (*hexutil.Big)(inner.DepositValue)
+		entry["retryTo"] = inner.RetryTo
+		entry["retryValue"] = (*hexutil.Big)(inner.RetryValue)
+		entry["retryData"] = (*hexutil.Bytes)(&inner.RetryData)
+		entry["beneficiary"] = &inner.Beneficiary
+		entry["refundTo"] = &inner.FeeRefundAddr
+		entry["maxSubmissionFee"] = (*hexutil.Big)(inner.MaxSubmissionFee)
 	}
 	if err := t.encoder.Encode(entry); err != nil {
 		return fmt.Errorf("failed to encode transaction entry %w", err)
@@ -310,10 +347,13 @@ func (t *TxLogger) Dump(index int, tx *types.Transaction, receipt *types.Receipt
 }
 
 func (t *TxLogger) Close() error {
+	if _, err := t.file.WriteString(t.sb.String()); err != nil {
+		return err
+	}
 	return t.file.Close()
 }
 
-func BlockDumpLogger(block *types.Block, perFolder, perFile uint64) error {
+func BlockDumpLogger(block *types.Block, l1BlockNumber, perFolder, perFile uint64) error {
 	file, err := getFile("blocks", block.NumberU64(), perFolder, perFile)
 	if err != nil {
 		return err
@@ -321,16 +361,18 @@ func BlockDumpLogger(block *types.Block, perFolder, perFile uint64) error {
 	defer file.Close()
 
 	entry := map[string]interface{}{
-		"timestamp":   block.Time(),
-		"blockNumber": block.NumberU64(),
-		"blockHash":   block.Hash(),
-		"parentHash":  block.ParentHash(),
-		"gasLimit":    block.GasLimit(),
-		"gasUsed":     block.GasUsed(),
-		"miner":       block.Coinbase(),
-		"difficulty":  block.Difficulty(),
-		"nonce":       block.Nonce(),
-		"size":        block.Size(),
+		"timestamp":     block.Time(),
+		"blockNumber":   block.NumberU64(),
+		"blockHash":     block.Hash(),
+		"parentHash":    block.ParentHash(),
+		"gasLimit":      block.GasLimit(),
+		"gasUsed":       block.GasUsed(),
+		"miner":         block.Coinbase(),
+		"difficulty":    block.Difficulty(),
+		"nonce":         block.Nonce(),
+		"size":          block.Size(),
+		"l1BlockNumber": l1BlockNumber,
+		"baseFeePerGas": block.BaseFee().Uint64(),
 	}
 	encoder := json.NewEncoder(file)
 	if err := encoder.Encode(entry); err != nil {
