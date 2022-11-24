@@ -37,7 +37,6 @@ func getFile(taskName string, blockNumber uint64, perFolder, perFile uint64) (*o
 	if err != nil {
 		return nil, fmt.Errorf("get current work dir failed: %w", err)
 	}
-	cwd = path.Join(cwd, "dump")
 	logPath := path.Join(cwd, taskName, strconv.FormatUint(blockNumber/perFolder, 10), strconv.FormatUint(blockNumber/perFile, 10)+".log")
 	fmt.Printf("log path: %v, block: %v\n", logPath, blockNumber)
 	if err := os.MkdirAll(path.Dir(logPath), 0755); err != nil {
@@ -268,11 +267,10 @@ type TxLogger struct {
 	file          *os.File
 	encoder       *json.Encoder
 	signer        types.Signer
-	isLondon      bool
 	baseFee       *big.Int
 }
 
-func NewTxLogger(signer types.Signer, isLondon bool, baseFee *big.Int, blockHash common.Hash, blockNumber, l1BlockNumber, perFolder, perFile uint64) (*TxLogger, error) {
+func NewTxLogger(signer types.Signer, baseFee *big.Int, blockHash common.Hash, blockNumber, l1BlockNumber, perFolder, perFile uint64) (*TxLogger, error) {
 	file, err := getFile("transactions", blockNumber, perFolder, perFile)
 	if err != nil {
 		return nil, err
@@ -285,7 +283,6 @@ func NewTxLogger(signer types.Signer, isLondon bool, baseFee *big.Int, blockHash
 		sb:            sb,
 		encoder:       json.NewEncoder(sb),
 		signer:        signer,
-		isLondon:      isLondon,
 		baseFee:       baseFee,
 		l1BlockNumber: l1BlockNumber,
 	}, nil
@@ -372,7 +369,7 @@ func BlockDumpLogger(block *types.Block, l1BlockNumber, perFolder, perFile uint6
 		"nonce":         block.Nonce(),
 		"size":          block.Size(),
 		"l1BlockNumber": l1BlockNumber,
-		"baseFeePerGas": block.BaseFee().Uint64(),
+		"baseFee":       block.BaseFee().Uint64(),
 	}
 	encoder := json.NewEncoder(file)
 	if err := encoder.Encode(entry); err != nil {
